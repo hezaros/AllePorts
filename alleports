@@ -6,11 +6,15 @@ import shutil
 import os
 import re
 import tempfile
+import warnings
 import xml.etree.ElementTree as ET
 from rich.console import Console
 from rich.table import Table
 from rich import box
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+
+# Suppress SSL warnings for HTTP header analysis
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 console = Console()
 
@@ -44,7 +48,7 @@ class AllePorts:
         filtered = [p for k, p in self.results.items() if p['state'] in ['filtered', 'open|filtered']]
         
         if filtered:
-             self._retry_smart(filtered)
+             self._retry_smart_exhaustive(filtered)
         
         self._print_report()
 
