@@ -48,42 +48,346 @@ class AllePorts:
         
         self._print_report()
 
-    def _retry_smart(self, filtered_ports):
-        """Attempts to re-scan filtered ports with different flags."""
-        console.print(f"\n[bold yellow]AllePorts Smart Retry:[/bold yellow] Attempting to unmask {len(filtered_ports)} filtered ports...")
+    def _detect_firewall(self):
+        """Detect firewall presence and type using ACK scan."""
+        console.print("\n[dim]Analyzing firewall configuration...[/dim]")
         
-        # Extract ports
-        ports = [p['port'] for p in filtered_ports]
-        if not ports:
-            return
+        # Select test ports: mix of common and random
+        test_ports = "80,443,22,3389,135,1234,9999,31337"
+        
+        result = self._run_nmap(["-sA", "-p", test_ports, "-Pn", "-T4"], 
+                                "Firewall Detection (ACK Scan)")
+        
+        if not result:
+            return {'present': False, 'type': 'unknown', 'filtering': 'none'}
+        
+        # Parse results
+        filtered_count = 0
+        unfiltered_count = 0
+        
+        for port_info in self.results.values():
+            state = port_info.get('state', '')
+            if state == 'filtered':
+                filtered_count += 1
+            elif state == 'unfiltered':
+                unfiltered_count += 1
+        
+        total = filtered_count + unfiltered_count
+        if total == 0:
+            return {'present': False, 'type': 'unknown', 'filtering': 'none'}
+        
+        filter_ratio = filtered_count / total
+        
+        # Analysis
+        if filter_ratio > 0.8:
+            fw_type = 'stateful'
+            filtering = 'aggressive'
+        elif filter_ratio > 0.3:
+            fw_type = 'stateful'
+            filtering = 'moderate'
+        elif filter_ratio > 0:
+            fw_type = 'stateless'
+            filtering = 'minimal'
+        else:
+            return {'present': False, 'type': 'none', 'filtering': 'none'}
+        
+        console.print(f"[bold yellow]Firewall detected: {fw_type} ({filtering} filtering)[/bold yellow]")
+        
+        return {
+            'present': True,
+            'type': fw_type,
+            'filtering': filtering,
+            'filter_ratio': filter_ratio
+        }
+
+    def _analyze_http_headers(self):
+        """Extract OS from HTTP headers - most reliable for external networks."""
+        # Check if 80 or 443 is open
+        http_ports = []
+        for (port, proto), info in self.results.items():
+            if info['state'] == 'open' and port in ['80', '443', '8080', '8443']:
+                http_ports.append(port)
+        
+        if not http_ports:
+            return None
+        
+        # Try HTTP request
+        for port in http_ports:
+            try:
+                import requests
+                protocol = 'https' if port in ['443', '8443'] else 'http'
+                url = f"{protocol}://{self.target}:{port}"
+                
+                response = requests.get(url, timeout=5, verify=False, 
+                                       headers={'User-Agent': 'Mozilla/5.0'})
+                
+                headers = response.headers
+                headers_str = str(headers).lower()
+                
+                # Windows indicators
+                if any(x in headers_str for x in ['microsoft-iis', 'asp.net', 'windows']):
+                    return 'windows', 95
+                
+                # Linux indicators
+                if any(x in headers_str for x in ['ubuntu', 'debian', 'centos', 'red hat', 'fedora']):
+                    return 'linux', 95
+                
+                # Server header analysis
+                server = headers.get('Server', '').lower()
+                if 'apache' in server or 'nginx' in server:
+                    return 'linux', 75
+                elif 'iis' in server:
+                    return 'windows', 90
+                    
+            except:
+                continue
+        
+        return None
+
+    def _analyze_service_banners(self):
+        """Enhanced banner analysis with version parsing."""
+        os_votes = {'windows': 0, 'linux': 0}
+        
+        for port_info in self.results.values():
+            if port_info['state'] != 'open':
+                continue
+                
+            service = port_info.get('service', '').lower()
             
-        # Nmap accepts comma separated ports, but too many might break command line length?
-        # Nmap can handle reasonably long lists. If > 500, maybe chunk it.
-        # For simplicity, let's take max 100 filtered ports to retry to avoid hanging forever.
+            # Strong indicators
+            if any(x in service for x in ['ubuntu', 'debian', 'centos', 'red hat', 'fedora']):
+                os_votes['linux'] += 5
+            elif any(x in service for x in ['microsoft', 'windows', 'win32']):
+                os_votes['windows'] += 5
+            
+            # Port-specific patterns
+            port = port_info['port']
+            if port == '22' and 'openssh' in service:
+                os_votes['linux'] += 3
+            elif port in ['135', '139', '445', '3389']:
+                os_votes['windows'] += 4
         
-        ports_to_retry = ports[:100]
-        port_arg = ",".join(ports_to_retry)
+        if os_votes['windows'] > os_votes['linux']:
+            confidence = min(90, 60 + os_votes['windows'] * 5)
+            return 'windows', confidence
+        elif os_votes['linux'] > os_votes['windows']:
+            confidence = min(90, 60 + os_votes['linux'] * 5)
+            return 'linux', confidence
         
-        if len(ports) > 100:
-            console.print(f"[dim]Too many filtered ports. Retrying top 100: {port_arg}[/dim]")
+        return None
+
+    def _nmap_os_detection_standard(self):
+        """Standard Nmap OS detection for clean targets."""
+        result = self._run_nmap(["-O", "--osscan-limit", "-Pn", "-T4"], 
+                                "Standard OS Detection")
+        return self._parse_os_from_xml(result) if result else None
+
+    def _nmap_os_detection_aggressive(self):
+        """Aggressive Nmap OS detection for firewalled targets."""
+        result = self._run_nmap(["-O", "--osscan-guess", "--max-os-tries", "2", "-Pn", "-T4"], 
+                                "Aggressive OS Detection")
+        return self._parse_os_from_xml(result) if result else None
+
+    def _parse_os_from_xml(self, xml_root):
+        """Extract OS classification from Nmap XML output."""
+        if xml_root is None:
+            return None
         
-        # Strategy 1: ACK Scan (-sA) - Good for mapping firewall rulesets
-        self._run_nmap(["-sA", "-p", port_arg, "-Pn"], "ACK Scan (Firewall mapping)")
+        try:
+            for host in xml_root.findall("host"):
+                os_elem = host.find("os")
+                if os_elem is not None:
+                    osmatch = os_elem.find("osmatch")
+                    if osmatch is not None:
+                        os_name = osmatch.get("name", "").lower()
+                        
+                        if "windows" in os_name:
+                            return "windows"
+                        elif any(x in os_name for x in ["linux", "ubuntu", "debian", "centos", "fedora"]):
+                            return "linux"
+                        elif any(x in os_name for x in ["bsd", "freebsd", "openbsd"]):
+                            return "bsd"
+                        elif "unix" in os_name:
+                            return "unix"
+        except:
+            pass
         
-        # Strategy 2: Window Scan (-sW) - Can reveal open ports on some systems
-        self._run_nmap(["-sW", "-p", port_arg, "-Pn"], "Window Scan")
+        return None
+
+    def _guess_os_from_firewall(self, fw_profile):
+        """Heuristic: Some firewall behaviors indicate OS."""
+        open_windows_ports = sum(1 for p in self.results.values() 
+                                 if p['state'] == 'open' 
+                                 and p['port'] in ['135', '139', '445', '3389'])
         
-        # Strategy 3: FIN Scan (-sF)
-        self._run_nmap(["-sF", "-p", port_arg, "-Pn"], "FIN Scan")
+        if open_windows_ports >= 2:
+            return 'windows'
         
-        # Strategy 4: Xmas Scan (-sX) - FIN, PSH, URG
-        self._run_nmap(["-sX", "-p", port_arg, "-Pn"], "Xmas Scan (FIN/PSH/URG)")
+        return None
+
+    def _detect_os_intelligent(self, fw_profile):
+        """Firewall-aware OS detection with multi-layer approach."""
+        detections = []
         
-        # Strategy 5: Maimon Scan (-sM) - FIN, ACK
-        self._run_nmap(["-sM", "-p", port_arg, "-Pn"], "Maimon Scan (FIN/ACK)")
+        # Layer 1: HTTP Headers (highest priority)
+        http_result = self._analyze_http_headers()
+        if http_result:
+            os_type, conf = http_result
+            detections.append(('http', os_type, conf))
+            console.print(f"[dim green]HTTP headers indicate: {os_type} ({conf}%)[/dim green]")
         
-        # Strategy 6: Null Scan (-sN) - No flags
-        self._run_nmap(["-sN", "-p", port_arg, "-Pn"], "Null Scan (No Flags)")
+        # Layer 2: Service Banners
+        banner_result = self._analyze_service_banners()
+        if banner_result:
+            os_type, conf = banner_result
+            detections.append(('banner', os_type, conf))
+            console.print(f"[dim green]Service banners indicate: {os_type} ({conf}%)[/dim green]")
+        
+        # Layer 3: Nmap -O (adaptive based on firewall)
+        nmap_os = None
+        if fw_profile['present']:
+            if fw_profile['filtering'] == 'aggressive':
+                console.print("[dim yellow]Heavy firewall - skipping Nmap OS scan[/dim yellow]")
+            else:
+                nmap_os = self._nmap_os_detection_aggressive()
+        else:
+            nmap_os = self._nmap_os_detection_standard()
+        
+        if nmap_os:
+            confidence = 80 if not fw_profile['present'] else 50
+            detections.append(('nmap', nmap_os, confidence))
+            console.print(f"[dim green]Nmap detection: {nmap_os} ({confidence}%)[/dim green]")
+        
+        # Layer 4: Firewall behavior
+        if fw_profile['present']:
+            fw_os = self._guess_os_from_firewall(fw_profile)
+            if fw_os:
+                detections.append(('firewall', fw_os, 40))
+        
+        # Weighted voting
+        if not detections:
+            return 'unknown', 0
+        
+        # If HTTP headers found something with high confidence, trust it
+        if detections and detections[0][0] == 'http' and detections[0][2] >= 90:
+            return detections[0][1], detections[0][2]
+        
+        # Otherwise aggregate
+        votes = {}
+        for source, os_type, confidence in detections:
+            votes[os_type] = votes.get(os_type, 0) + confidence
+        
+        winner = max(votes, key=votes.get)
+        matching_detections = [d for d in detections if d[1] == winner]
+        avg_confidence = int(votes[winner] / len(matching_detections)) if matching_detections else 0
+        
+        return winner, min(95, avg_confidence)
+
+    def _get_scan_sequence(self, os_type):
+        """Returns optimal scan order for OS - ACK removed from retry."""
+        if os_type == 'linux':
+            return [
+                (["-sF", "-Pn", "-T4"], "FIN Scan"),
+                (["-sN", "-Pn", "-T4"], "Null Scan"),
+                (["-sX", "-Pn", "-T4"], "Xmas Scan"),
+                (["-sM", "-Pn", "-T4"], "Maimon Scan"),
+            ]
+        elif os_type == 'windows':
+            console.print("[yellow]Windows detected - filtered ports harder to unmask[/yellow]")
+            return [
+                (["-sW", "-Pn", "-T4"], "Window Scan"),
+                (["-sF", "-Pn", "-T4"], "FIN Scan"),
+                (["-sN", "-Pn", "-T4"], "Null Scan"),
+            ]
+        else:
+            return [
+                (["-sW", "-Pn", "-T4"], "Window Scan"),
+                (["-sF", "-Pn", "-T4"], "FIN Scan"),
+                (["-sN", "-Pn", "-T4"], "Null Scan"),
+                (["-sX", "-Pn", "-T4"], "Xmas Scan"),
+            ]
+
+    def _get_still_filtered(self, port_list):
+        """Returns ports that are still filtered/open|filtered."""
+        still_filtered = []
+        
+        for port in port_list:
+            for (p, proto), info in self.results.items():
+                if p == port and info['state'] in ['filtered', 'open|filtered']:
+                    still_filtered.append(info)
+                    break
+        
+        return still_filtered
+
+    def _retry_smart_exhaustive(self, filtered_ports):
+        """Exhaustive but optimized retry - zero port loss guarantee."""
+        
+        # Step 1: Firewall profiling
+        fw_profile = self._detect_firewall()
+        
+        # Step 2: OS Detection
+        os_type, confidence = self._detect_os_intelligent(fw_profile)
+        
+        console.print(f"\n[bold green]Smart Retry Strategy:[/bold green]")
+        console.print(f"  Target OS: [cyan]{os_type}[/cyan] (confidence: {confidence}%)")
+        console.print(f"  Firewall: [yellow]{fw_profile['type']}[/yellow] ({fw_profile['filtering']} filtering)")
+        console.print(f"  Initial filtered ports: [red]{len(filtered_ports)}[/red]\n")
+        
+        # Step 3: Get OS-specific scan sequence
+        scan_sequence = self._get_scan_sequence(os_type)
+        
+        # Step 4: Incremental scanning with batch processing
+        remaining_filtered = [p for p in filtered_ports]
+        total_rescued = 0
+        
+        console.print(f"[bold yellow]Processing {len(remaining_filtered)} filtered ports...[/bold yellow]\n")
+        
+        for idx, (flags, description) in enumerate(scan_sequence, 1):
+            if not remaining_filtered:
+                console.print(f"[bold green]✓ All filtered ports resolved![/bold green]")
+                break
+            
+            # Batch processing: 200 port chunks
+            rescued_this_round = 0
+            
+            for batch_start in range(0, len(remaining_filtered), 200):
+                batch = remaining_filtered[batch_start:batch_start + 200]
+                port_list = [p['port'] for p in batch]
+                port_arg = ",".join(port_list)
+                
+                batch_info = f"batch {batch_start//200 + 1}/{(len(remaining_filtered)-1)//200 + 1}" if len(remaining_filtered) > 200 else ""
+                console.print(f"[dim]Scan {idx}/{len(scan_sequence)}: {description} - {len(port_list)} ports {batch_info}[/dim]")
+                
+                # Run scan
+                self._run_nmap(flags + ["-p", port_arg], description)
+            
+            # After all batches, recalculate what's still filtered
+            new_remaining = []
+            for p in remaining_filtered:
+                key = (p['port'], p['protocol'])
+                current_state = self.results.get(key, {}).get('state', 'filtered')
+                
+                if current_state in ['filtered', 'open|filtered']:
+                    new_remaining.append(p)
+            
+            rescued = len(remaining_filtered) - len(new_remaining)
+            total_rescued += rescued
+            
+            if rescued > 0:
+                console.print(f"[bold green]  ✓ {rescued} port(s) unmasked[/bold green]")
+            else:
+                console.print(f"[dim]  → No change[/dim]")
+            
+            remaining_filtered = new_remaining
+        
+        # Final report
+        console.print(f"\n[bold cyan]═══ Smart Retry Complete ═══[/bold cyan]")
+        console.print(f"  Scans executed: [cyan]{idx}[/cyan]")
+        console.print(f"  Ports rescued: [green]{total_rescued}[/green]")
+        console.print(f"  Still filtered: [yellow]{len(remaining_filtered)}[/yellow]")
+        
+        if remaining_filtered:
+            console.print(f"\n[dim]Note: {len(remaining_filtered)} ports remain filtered (likely truly blocked)[/dim]")
 
     def _run_nmap(self, args, description):
         """Runs nmap with provided args and returns parsed XML root or None."""
@@ -333,11 +637,33 @@ class AllePorts:
         console.print(table)
         
         # Summary stats
-        open_count = sum(1 for p in self.results.values() if 'open' in p['state'] and 'filtered' not in p['state'])
-        filtered_count = sum(1 for p in self.results.values() if 'filtered' in p['state'])
-        closed_count = sum(1 for p in self.results.values() if 'closed' in p['state'])
+        # Summary stats
+        state_counts = {}
+        for p in self.results.values():
+            s = p['state']
+            state_counts[s] = state_counts.get(s, 0) + 1
+            
+        summary_parts = []
+        # Sort order: open, open|filtered, filtered, closed|filtered, closed, unfiltered
+        pm = {"open": 0, "open|filtered": 1, "filtered": 2, "closed|filtered": 3, "closed": 4, "unfiltered": 5}
         
-        console.print(f"\n[green]System Analysis:[/green] [bold green]{open_count} UNLOCKED[/bold green] | [bold red]{closed_count} LOCKED[/bold red] | [bold yellow]{filtered_count} HIDDEN[/bold yellow]")
+        for state, count in sorted(state_counts.items(), key=lambda x: pm.get(x[0], 99)):
+            state_upper = state.upper()
+            if "open" in state and "filtered" not in state:
+                style = "bold green"
+            elif "filtered" in state:
+                style = "bold yellow"
+            elif "closed" in state:
+                style = "bold red"
+            else:
+                style = "bold white"
+                
+            summary_parts.append(f"[{style}]{count} {state_upper}[/{style}]")
+            
+        if summary_parts:
+             console.print(f"\n[bold]Scan Summary:[/bold] {' | '.join(summary_parts)}")
+        else:
+             console.print("\n[bold]Scan Summary:[/bold] No results.")
 
 def main():
     parser = argparse.ArgumentParser(description="AllePorts - Advanced Smart Port Scanner")
